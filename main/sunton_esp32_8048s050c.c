@@ -28,7 +28,7 @@ const esp_lcd_rgb_panel_config_t panel_config = {
 #else
     .num_fbs = 1,
 #endif
-    .clk_src = LCD_CLK_SRC_PLL160M,
+    .clk_src = LCD_CLK_SRC_XTAL,  // Use crystal oscillator (40MHz, independent of WiFi/CPU)
     .timings = {
         .pclk_hz = (16*1000000),
         .h_res = SUNTON_ESP32_LCD_WIDTH,
@@ -47,8 +47,6 @@ const esp_lcd_rgb_panel_config_t panel_config = {
             .pclk_idle_high = false,
         },
     },
-    .sram_trans_align = 8,
-    .psram_trans_align = 64,
     .hsync_gpio_num = GPIO_NUM_39,
     .vsync_gpio_num = GPIO_NUM_41,
     .de_gpio_num = GPIO_NUM_40,

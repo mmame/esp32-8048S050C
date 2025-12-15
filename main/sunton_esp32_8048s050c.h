@@ -33,6 +33,11 @@
 #define SUNTON_ESP32_BACKLIGHT_LEDC_TIMER       LEDC_TIMER_0
 #define SUNTON_ESP32_BACKLIGHT_LEDC_CHANNEL     LEDC_CHANNEL_0
 
+// I2S Audio pins (MAX98357 amplifier)
+#define SUNTON_ESP32_I2S_BCLK                   GPIO_NUM_0   // Bit clock (v1.1)
+#define SUNTON_ESP32_I2S_LRCLK                  GPIO_NUM_18  // Word select
+#define SUNTON_ESP32_I2S_DIN                    GPIO_NUM_17  // Data in
+
 #define LVGL_TICK_PERIOD_MS                     2
 
 void sunton_esp32s3_backlight_init(void);

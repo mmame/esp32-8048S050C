@@ -33,8 +33,15 @@ void app_main(void)
     i2c_master_bus_handle_t i2c_master = sunton_esp32s3_i2c_master();
     sunton_esp32s3_touch_init(i2c_master);
 
-    // Initialize audio player UI
+    // Initialize audio player UI first
     audio_player_ui_init(disp);
+    
+    // Initialize SD card (needed for audio files)
+    file_manager_sd_init();
+    
+    // Initialize I2S audio and scan for WAV files (will update UI)
+    audio_player_init_i2s();
+    audio_player_scan_wav_files();
     
     // Initialize file manager UI (hidden by default)
     lv_lock();
@@ -43,4 +50,7 @@ void app_main(void)
     // Initialize WiFi config UI (hidden by default)
     wifi_config_ui_init(lv_screen_active());
     lv_unlock();
+    
+    // Trigger auto-play if enabled
+    audio_player_show();
 }

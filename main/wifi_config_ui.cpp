@@ -544,8 +544,8 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
         lv_obj_set_style_text_color(status_label, lv_color_hex(0x00FF00), 0);
         
         char ip_info[100];
-        snprintf(ip_info, sizeof(ip_info), "IP: " IPSTR "\\nSSID: %s", 
-                 IP2STR(&event->ip_info.ip), sta_ssid);
+        snprintf(ip_info, sizeof(ip_info), "IP: " IPSTR, 
+                 IP2STR(&event->ip_info.ip));
         lv_label_set_text(ip_label, ip_info);
         
         // Start web server

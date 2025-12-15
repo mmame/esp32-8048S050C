@@ -4,9 +4,46 @@
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "driver/i2s_std.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+static const char *TAG = "AudioPlayer";
 
 #define TRANSITION_IGNORE_MS 300  // Ignore events for 300ms after screen transition
+#define MAX_WAV_FILES 100
+#define MAX_FILENAME_LEN 64
+#define I2S_BUFFER_SIZE 1024
+#define WAV_HEADER_SIZE 44
+#define NVS_NAMESPACE "audio_player"
+
+// WAV file structure
+typedef struct {
+    char name[MAX_FILENAME_LEN];
+    char path[320];  // Increased to accommodate "/sdcard/" + 255 char filename + null
+    uint32_t sample_rate;
+    uint16_t num_channels;
+    uint16_t bits_per_sample;
+    uint32_t data_size;
+} wav_file_t;
+
+// Audio playback state
+static wav_file_t wav_files[MAX_WAV_FILES];
+static int wav_file_count = 0;
+static int current_track = -1;
+static bool is_playing = false;
+static bool is_paused = false;
+static TaskHandle_t audio_task_handle = NULL;
+static i2s_chan_handle_t tx_handle = NULL;
+static FILE *current_file = NULL;
+static volatile uint32_t seek_position = 0;  // Byte position to seek to (0 = no seek)
+static uint32_t wav_data_start_offset = 0;   // Offset in file where WAV data starts
+static bool auto_play_enabled = false;       // Auto-play on screen show
+static bool continue_playback_enabled = false; // Continue to next track when finished
 
 // Stats overlay
 static lv_obj_t * cpu_label = NULL;
@@ -22,6 +59,17 @@ static lv_obj_t * time_total_label = NULL;
 static lv_obj_t * autoplay_checkbox = NULL;
 static lv_obj_t * continue_checkbox = NULL;
 static lv_obj_t * audio_player_screen = NULL;
+
+// Forward declarations
+static void btn_prev_event_cb(lv_event_t *e);
+static void btn_play_event_cb(lv_event_t *e);
+static void btn_pause_event_cb(lv_event_t *e);
+static void btn_next_event_cb(lv_event_t *e);
+static void progress_bar_event_cb(lv_event_t *e);
+static void autoplay_checkbox_event_cb(lv_event_t *e);
+static void continue_checkbox_event_cb(lv_event_t *e);
+static void load_audio_config(void);
+static void save_audio_config(void);
 
 static void update_stats_timer_cb(lv_timer_t * timer)
 {
@@ -66,30 +114,41 @@ static void flush_event_cb(lv_event_t * e)
 static void progress_bar_event_cb(lv_event_t * e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t * bar = (lv_obj_t *)lv_event_get_target(e);
     
     if (code == LV_EVENT_CLICKED || code == LV_EVENT_PRESSING) {
-        lv_indev_t * indev = lv_indev_active();
+        if (current_track < 0 || current_track >= wav_file_count) return;
+        if (!is_playing && !is_paused) return;
+        
+        // Get click coordinates
         lv_point_t point;
-        lv_indev_get_point(indev, &point);
+        lv_indev_get_point(lv_indev_active(), &point);
         
-        // Get bar position and size
-        int32_t bar_x = lv_obj_get_x(bar);
-        int32_t bar_width = lv_obj_get_width(bar);
+        // Get progress bar coordinates and dimensions
+        lv_area_t coords;
+        lv_obj_get_coords(progress_bar, &coords);
         
-        // Calculate clicked position relative to bar
-        int32_t click_pos = point.x - bar_x;
-        if (click_pos < 0) click_pos = 0;
-        if (click_pos > bar_width) click_pos = bar_width;
+        int32_t bar_width = lv_area_get_width(&coords);
+        int32_t bar_left = coords.x1;
+        int32_t click_x = point.x - bar_left;
         
-        // Calculate percentage
-        int32_t new_value = (click_pos * 100) / bar_width;
+        // Calculate percentage (0-100)
+        if (click_x < 0) click_x = 0;
+        if (click_x > bar_width) click_x = bar_width;
         
-        // Update progress bar
-        lv_bar_set_value(bar, new_value, LV_ANIM_OFF);
+        uint32_t percentage = (click_x * 100) / bar_width;
         
-        // TODO: Update time labels and trigger seek in audio playback
-        // For now, just update the visual
+        // Calculate byte position in the audio data
+        wav_file_t *wav = &wav_files[current_track];
+        uint32_t target_byte = (wav->data_size * percentage) / 100;
+        
+        // Align to sample boundary (important for proper audio playback)
+        uint32_t bytes_per_sample = wav->num_channels * (wav->bits_per_sample / 8);
+        target_byte = (target_byte / bytes_per_sample) * bytes_per_sample;
+        
+        // Set seek position (will be picked up by playback task)
+        seek_position = target_byte;
+        
+        ESP_LOGI(TAG, "Seek to %lu%% (%lu bytes)", percentage, target_byte);
     }
 }
 
@@ -143,13 +202,9 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_text_font(title_label, &lv_font_montserrat_48, 0);
     lv_label_set_long_mode(title_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_label_set_text(title_label, "This is a Very Very Very Very Long Title To Test Scrolling Feature");
+    lv_label_set_text(title_label, "No track loaded");
     // Set constant scroll speed (pixels per second)
-    const char * text = lv_label_get_text(title_label);
-    lv_point_t text_size;
-    lv_text_get_size(&text_size, text, lv_obj_get_style_text_font(title_label, 0), 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
-    uint32_t anim_time = (text_size.x * 1000) / 90;  // pixels per second
-    lv_obj_set_style_anim_time(title_label, anim_time, 0);
+    lv_obj_set_style_anim_time(title_label, 5000, 0);
     
     // Create progress bar
     progress_bar = lv_bar_create(screen);
@@ -161,7 +216,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_set_style_border_width(progress_bar, 2, 0);
     lv_obj_set_style_bg_color(progress_bar, lv_color_hex(0x00FF00), LV_PART_INDICATOR);
     lv_bar_set_range(progress_bar, 0, 100);
-    lv_bar_set_value(progress_bar, 35, LV_ANIM_OFF);
+    lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
     lv_obj_add_flag(progress_bar, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(progress_bar, progress_bar_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(progress_bar, progress_bar_event_cb, LV_EVENT_PRESSING, NULL);
@@ -171,14 +226,14 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_align(time_label, LV_ALIGN_TOP_LEFT, 40, 180);
     lv_obj_set_style_text_color(time_label, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_font(time_label, &lv_font_montserrat_48, 0);
-    lv_label_set_text(time_label, "01:23");
+    lv_label_set_text(time_label, "00:00");
     
     // Create time total label (right side, below progress bar)
     time_total_label = lv_label_create(screen);
     lv_obj_align(time_total_label, LV_ALIGN_TOP_RIGHT, -40, 180);
     lv_obj_set_style_text_color(time_total_label, lv_color_hex(0xCCCCCC), 0);
     lv_obj_set_style_text_font(time_total_label, &lv_font_montserrat_48, 0);
-    lv_label_set_text(time_total_label, "03:45");
+    lv_label_set_text(time_total_label, "00:00");
     
     // Create control buttons (centered below time labels)
     int button_size = 100;
@@ -197,6 +252,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_label_set_text(label_prev, LV_SYMBOL_PREV);
     lv_obj_set_style_text_font(label_prev, &lv_font_montserrat_48, 0);
     lv_obj_center(label_prev);
+    lv_obj_add_event_cb(btn_prev, btn_prev_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Play button
     lv_obj_t * btn_play = lv_button_create(screen);
@@ -208,6 +264,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_label_set_text(label_play, LV_SYMBOL_PLAY);
     lv_obj_set_style_text_font(label_play, &lv_font_montserrat_48, 0);
     lv_obj_center(label_play);
+    lv_obj_add_event_cb(btn_play, btn_play_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Pause button
     lv_obj_t * btn_pause = lv_button_create(screen);
@@ -219,6 +276,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_label_set_text(label_pause, LV_SYMBOL_PAUSE);
     lv_obj_set_style_text_font(label_pause, &lv_font_montserrat_48, 0);
     lv_obj_center(label_pause);
+    lv_obj_add_event_cb(btn_pause, btn_pause_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Next button
     lv_obj_t * btn_next = lv_button_create(screen);
@@ -230,6 +288,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_label_set_text(label_next, LV_SYMBOL_NEXT);
     lv_obj_set_style_text_font(label_next, &lv_font_montserrat_48, 0);
     lv_obj_center(label_next);
+    lv_obj_add_event_cb(btn_next, btn_next_event_cb, LV_EVENT_CLICKED, NULL);
     
     // Create Auto-Play checkbox (bottom-left)
     autoplay_checkbox = lv_checkbox_create(screen);
@@ -238,6 +297,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_set_style_text_color(autoplay_checkbox, lv_color_hex(0xCCCCCC), 0);
     lv_obj_align(autoplay_checkbox, LV_ALIGN_BOTTOM_LEFT, 40, -20);
     lv_obj_set_style_bg_color(autoplay_checkbox, lv_color_hex(0x00AA00), LV_PART_INDICATOR);
+    lv_obj_add_event_cb(autoplay_checkbox, autoplay_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     
     // Create Continue Playback checkbox (bottom-center)
     continue_checkbox = lv_checkbox_create(screen);
@@ -246,6 +306,7 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_set_style_text_color(continue_checkbox, lv_color_hex(0xCCCCCC), 0);
     lv_obj_align(continue_checkbox, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_obj_set_style_bg_color(continue_checkbox, lv_color_hex(0x00AA00), LV_PART_INDICATOR);
+    lv_obj_add_event_cb(continue_checkbox, continue_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     
     // Create CPU label (bottom-right corner for debugging)
     cpu_label = lv_label_create(screen);
@@ -255,6 +316,17 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_set_style_pad_all(cpu_label, 4, 0);
     lv_obj_align(cpu_label, LV_ALIGN_BOTTOM_RIGHT, -5, -5);
     lv_label_set_text(cpu_label, "CPU: --");
+    
+    // Load saved settings from NVS
+    load_audio_config();
+    
+    // Set checkbox states based on loaded values
+    if (auto_play_enabled) {
+        lv_obj_add_state(autoplay_checkbox, LV_STATE_CHECKED);
+    }
+    if (continue_playback_enabled) {
+        lv_obj_add_state(continue_checkbox, LV_STATE_CHECKED);
+    }
     
     // Add swipe gesture support to screen
     lv_obj_add_event_cb(screen, screen_gesture_event_cb, LV_EVENT_GESTURE, NULL);
@@ -301,4 +373,657 @@ lv_obj_t * audio_player_get_autoplay_checkbox(void)
 lv_obj_t * audio_player_get_continue_checkbox(void)
 {
     return continue_checkbox;
+}
+
+// Load audio player settings from NVS
+static void load_audio_config(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err == ESP_OK) {
+        uint8_t auto_play = 0;
+        nvs_get_u8(nvs_handle, "auto_play", &auto_play);
+        auto_play_enabled = (auto_play != 0);
+        
+        uint8_t continue_play = 0;
+        nvs_get_u8(nvs_handle, "continue_play", &continue_play);
+        continue_playback_enabled = (continue_play != 0);
+        
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "Loaded audio config: auto_play=%d, continue_play=%d", auto_play_enabled, continue_playback_enabled);
+    } else {
+        ESP_LOGI(TAG, "No saved audio config, using defaults");
+    }
+}
+
+// Save audio player settings to NVS
+static void save_audio_config(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs_handle, "auto_play", auto_play_enabled ? 1 : 0);
+        nvs_set_u8(nvs_handle, "continue_play", continue_playback_enabled ? 1 : 0);
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+        ESP_LOGI(TAG, "Saved audio config");
+    }
+}
+
+// ========== Checkbox Event Handlers ==========
+
+static void autoplay_checkbox_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t *checkbox = (lv_obj_t *)lv_event_get_target(e);
+        auto_play_enabled = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
+        ESP_LOGI(TAG, "Auto-play %s", auto_play_enabled ? "enabled" : "disabled");
+        save_audio_config();
+    }
+}
+
+static void continue_checkbox_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t *checkbox = (lv_obj_t *)lv_event_get_target(e);
+        continue_playback_enabled = lv_obj_has_state(checkbox, LV_STATE_CHECKED);
+        ESP_LOGI(TAG, "Continue playback %s", continue_playback_enabled ? "enabled" : "disabled");
+        save_audio_config();
+    }
+}
+
+// ========== Button Event Handlers ==========
+
+static void btn_prev_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        ESP_LOGI(TAG, "Previous button clicked");
+        audio_player_previous();
+    }
+}
+
+static void btn_play_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        ESP_LOGI(TAG, "Play button clicked");
+        if (is_playing && !is_paused) {
+            ESP_LOGI(TAG, "Already playing");
+        } else if (is_paused) {
+            audio_player_resume();
+        } else {
+            // Start playing current track (or first track if none selected)
+            if (wav_file_count > 0) {
+                int track = (current_track >= 0 && current_track < wav_file_count) ? current_track : 0;
+                audio_player_play(wav_files[track].name);
+            }
+        }
+    }
+}
+
+static void btn_pause_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        ESP_LOGI(TAG, "Pause button clicked");
+        if (is_playing && !is_paused) {
+            audio_player_pause();
+        }
+    }
+}
+
+static void btn_next_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED) {
+        ESP_LOGI(TAG, "Next button clicked");
+        audio_player_next();
+    }
+}
+
+// ========== I2S and Audio Playback Implementation ==========
+
+// Parse WAV file header
+static bool parse_wav_header(FILE *file, wav_file_t *wav_info)
+{
+    uint8_t header[WAV_HEADER_SIZE];
+    
+    if (fread(header, 1, WAV_HEADER_SIZE, file) != WAV_HEADER_SIZE) {
+        ESP_LOGE(TAG, "Failed to read WAV header");
+        return false;
+    }
+    
+    // Check RIFF header
+    if (memcmp(header, "RIFF", 4) != 0) {
+        ESP_LOGE(TAG, "Invalid RIFF header");
+        return false;
+    }
+    
+    // Check WAVE format
+    if (memcmp(header + 8, "WAVE", 4) != 0) {
+        ESP_LOGE(TAG, "Invalid WAVE format");
+        return false;
+    }
+    
+    // Check fmt subchunk
+    if (memcmp(header + 12, "fmt ", 4) != 0) {
+        ESP_LOGE(TAG, "Invalid fmt subchunk");
+        return false;
+    }
+    
+    // Parse format data
+    uint16_t audio_format = header[20] | (header[21] << 8);
+    if (audio_format != 1) {  // PCM
+        ESP_LOGE(TAG, "Only PCM format supported");
+        return false;
+    }
+    
+    wav_info->num_channels = header[22] | (header[23] << 8);
+    wav_info->sample_rate = header[24] | (header[25] << 8) | (header[26] << 16) | (header[27] << 24);
+    wav_info->bits_per_sample = header[34] | (header[35] << 8);
+    
+    // Find data chunk - it may be beyond the first 44 bytes
+    uint32_t fmt_size = header[16] | (header[17] << 8) | (header[18] << 16) | (header[19] << 24);
+    uint32_t offset = 20 + fmt_size;  // Start after fmt chunk
+    
+    // Search for data chunk (read more if needed)
+    uint8_t chunk_header[8];
+    fseek(file, offset, SEEK_SET);
+    
+    while (fread(chunk_header, 1, 8, file) == 8) {
+        if (memcmp(chunk_header, "data", 4) == 0) {
+            wav_info->data_size = chunk_header[4] | (chunk_header[5] << 8) | 
+                                 (chunk_header[6] << 16) | (chunk_header[7] << 24);
+            // Save data start offset and leave file position at start of data
+            wav_data_start_offset = ftell(file);
+            return true;
+        }
+        
+        // Skip this chunk and move to next
+        uint32_t chunk_size = chunk_header[4] | (chunk_header[5] << 8) | 
+                             (chunk_header[6] << 16) | (chunk_header[7] << 24);
+        fseek(file, chunk_size, SEEK_CUR);
+        offset += 8 + chunk_size;
+        
+        // Prevent infinite loop
+        if (offset > 10000) {
+            ESP_LOGE(TAG, "Data chunk not found in first 10KB");
+            return false;
+        }
+    }
+    
+    ESP_LOGE(TAG, "Data chunk not found");
+    return false;
+}
+
+// Audio playback task
+static void audio_playback_task(void *arg)
+{
+    uint8_t *buffer = (uint8_t *)heap_caps_malloc(I2S_BUFFER_SIZE, MALLOC_CAP_DMA);
+    if (!buffer) {
+        ESP_LOGE(TAG, "Failed to allocate DMA buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Get current track info
+    if (current_track < 0 || current_track >= wav_file_count) {
+        free(buffer);
+        audio_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    wav_file_t *wav = &wav_files[current_track];
+    uint32_t bytes_per_second = wav->sample_rate * wav->num_channels * (wav->bits_per_sample / 8);
+    uint32_t total_bytes = wav->data_size;
+    uint32_t bytes_played = 0;
+    uint32_t last_update_time = 0;
+    
+    while (is_playing) {
+        if (is_paused) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        
+        if (!current_file) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        
+        // Handle seek request
+        if (seek_position > 0) {
+            uint32_t seek_pos = seek_position;
+            seek_position = 0;  // Clear seek request
+            
+            // Seek to the requested position in the file
+            if (fseek(current_file, wav_data_start_offset + seek_pos, SEEK_SET) == 0) {
+                bytes_played = seek_pos;
+                ESP_LOGI(TAG, "Seeked to position %lu bytes", seek_pos);
+            } else {
+                ESP_LOGE(TAG, "Seek failed");
+            }
+        }
+        
+        size_t bytes_read = fread(buffer, 1, I2S_BUFFER_SIZE, current_file);
+        
+        if (bytes_read > 0) {
+            size_t bytes_written = 0;
+            i2s_channel_write(tx_handle, buffer, bytes_read, &bytes_written, portMAX_DELAY);
+            
+            bytes_played += bytes_written;
+            
+            // Update UI every 200ms to avoid excessive locking
+            uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            if (now - last_update_time >= 200) {
+                last_update_time = now;
+                
+                // Calculate progress
+                uint32_t progress = (bytes_played * 100) / total_bytes;
+                if (progress > 100) progress = 100;
+                
+                // Calculate elapsed time
+                uint32_t elapsed_seconds = bytes_played / bytes_per_second;
+                uint32_t minutes = elapsed_seconds / 60;
+                uint32_t seconds = elapsed_seconds % 60;
+                
+                // Update UI with LVGL lock
+                lv_lock();
+                if (progress_bar) {
+                    lv_bar_set_value(progress_bar, progress, LV_ANIM_OFF);
+                }
+                if (time_label) {
+                    char time_text[16];
+                    snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+                    lv_label_set_text(time_label, time_text);
+                }
+                lv_unlock();
+            }
+        } else {
+            // End of file
+            ESP_LOGI(TAG, "Finished playing track");
+            
+            // Update UI to show 100% completion
+            lv_lock();
+            if (progress_bar) {
+                lv_bar_set_value(progress_bar, 100, LV_ANIM_OFF);
+            }
+            lv_unlock();
+            
+            // Check if we should continue to next track
+            if (continue_playback_enabled && wav_file_count > 0) {
+                int next_track = (current_track + 1) % wav_file_count;
+                ESP_LOGI(TAG, "Continue playback: playing next track %d", next_track);
+                
+                // Close current file
+                if (current_file) {
+                    fclose(current_file);
+                    current_file = NULL;
+                }
+                
+                // Open next track
+                current_track = next_track;
+                wav_file_t *wav = &wav_files[current_track];
+                current_file = fopen(wav->path, "rb");
+                
+                if (current_file && parse_wav_header(current_file, wav)) {
+                    // Reconfigure I2S for new sample rate if needed
+                    i2s_channel_disable(tx_handle);
+                    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(wav->sample_rate);
+                    i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
+                    i2s_channel_enable(tx_handle);
+                    
+                    // Update UI
+                    lv_lock();
+                    lv_label_set_text(title_label, wav->name);
+                    if (progress_bar) {
+                        lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
+                    }
+                    if (time_label) {
+                        lv_label_set_text(time_label, "00:00");
+                    }
+                    if (time_total_label && wav->sample_rate > 0) {
+                        uint32_t total_seconds = wav->data_size / 
+                            (wav->sample_rate * wav->num_channels * (wav->bits_per_sample / 8));
+                        uint32_t minutes = total_seconds / 60;
+                        uint32_t seconds = total_seconds % 60;
+                        char time_text[16];
+                        snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+                        lv_label_set_text(time_total_label, time_text);
+                    }
+                    lv_unlock();
+                    
+                    // Reset playback state for new track
+                    bytes_per_second = wav->sample_rate * wav->num_channels * (wav->bits_per_sample / 8);
+                    total_bytes = wav->data_size;
+                    bytes_played = 0;
+                    seek_position = 0;
+                    
+                    ESP_LOGI(TAG, "Started playing next track: %s", wav->name);
+                    continue;  // Continue playing
+                } else {
+                    ESP_LOGE(TAG, "Failed to open next track");
+                    if (current_file) {
+                        fclose(current_file);
+                        current_file = NULL;
+                    }
+                }
+            }
+            
+            is_playing = false;
+            break;
+        }
+    }
+    
+    free(buffer);
+    audio_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// Initialize I2S
+void audio_player_init_i2s(void)
+{
+    ESP_LOGI(TAG, "Initializing I2S...");
+    
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, NULL));
+    
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(44100),
+        .slot_cfg = I2S_STD_PCM_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_GPIO_UNUSED,
+            .bclk = SUNTON_ESP32_I2S_BCLK,
+            .ws = SUNTON_ESP32_I2S_LRCLK,
+            .dout = SUNTON_ESP32_I2S_DIN,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+    
+    ESP_LOGI(TAG, "I2S initialized successfully");
+}
+
+// Scan for WAV files on SD card
+void audio_player_scan_wav_files(void)
+{
+    ESP_LOGI(TAG, "Scanning for WAV files...");
+    wav_file_count = 0;
+    
+    DIR *dir = opendir("/sdcard");
+    if (!dir) {
+        ESP_LOGE(TAG, "Failed to open SD card directory");
+        return;
+    }
+    
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL && wav_file_count < MAX_WAV_FILES) {
+        if (entry->d_type == DT_REG) {
+            // Check if file has .wav extension
+            const char *ext = strrchr(entry->d_name, '.');
+            if (ext && (strcasecmp(ext, ".wav") == 0)) {
+                strncpy(wav_files[wav_file_count].name, entry->d_name, MAX_FILENAME_LEN - 1);
+                snprintf(wav_files[wav_file_count].path, sizeof(wav_files[wav_file_count].path), 
+                        "/sdcard/%s", entry->d_name);
+                
+                // Try to parse header for file info
+                FILE *f = fopen(wav_files[wav_file_count].path, "rb");
+                if (f) {
+                    parse_wav_header(f, &wav_files[wav_file_count]);
+                    fclose(f);
+                }
+                
+                ESP_LOGI(TAG, "Found WAV file: %s (%lu Hz, %d ch, %d bit)", 
+                        wav_files[wav_file_count].name,
+                        wav_files[wav_file_count].sample_rate,
+                        wav_files[wav_file_count].num_channels,
+                        wav_files[wav_file_count].bits_per_sample);
+                
+                wav_file_count++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    ESP_LOGI(TAG, "Found %d WAV files", wav_file_count);
+    
+    // Sort files alphabetically/numerically
+    if (wav_file_count > 1) {
+        for (int i = 0; i < wav_file_count - 1; i++) {
+            for (int j = i + 1; j < wav_file_count; j++) {
+                if (strcasecmp(wav_files[i].name, wav_files[j].name) > 0) {
+                    // Swap
+                    wav_file_t temp = wav_files[i];
+                    wav_files[i] = wav_files[j];
+                    wav_files[j] = temp;
+                }
+            }
+        }
+        ESP_LOGI(TAG, "Sorted WAV files alphabetically");
+    }
+    
+    // Update UI with first file if available
+    if (wav_file_count > 0 && title_label) {
+        char info_text[128];
+        snprintf(info_text, sizeof(info_text), "%s (%lu Hz, %d ch, %d bit)", 
+                wav_files[0].name,
+                wav_files[0].sample_rate,
+                wav_files[0].num_channels,
+                wav_files[0].bits_per_sample);
+        lv_label_set_text(title_label, info_text);
+        
+        // Calculate and display total time
+        if (wav_files[0].sample_rate > 0) {
+            uint32_t total_seconds = wav_files[0].data_size / 
+                (wav_files[0].sample_rate * wav_files[0].num_channels * (wav_files[0].bits_per_sample / 8));
+            uint32_t minutes = total_seconds / 60;
+            uint32_t seconds = total_seconds % 60;
+            char time_text[16];
+            snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+            lv_label_set_text(time_total_label, time_text);
+        }
+    } else if (title_label) {
+        lv_label_set_text(title_label, "No WAV files found on SD card");
+    }
+}
+
+// Play a WAV file
+void audio_player_play(const char *filename)
+{
+    audio_player_stop();
+    
+    // Find the file in our list
+    int track_idx = -1;
+    for (int i = 0; i < wav_file_count; i++) {
+        if (strcmp(wav_files[i].name, filename) == 0) {
+            track_idx = i;
+            break;
+        }
+    }
+    
+    if (track_idx < 0) {
+        ESP_LOGE(TAG, "File not found in playlist: %s", filename);
+        return;
+    }
+    
+    current_track = track_idx;
+    current_file = fopen(wav_files[track_idx].path, "rb");
+    
+    if (!current_file) {
+        ESP_LOGE(TAG, "Failed to open file: %s", wav_files[track_idx].path);
+        return;
+    }
+    
+    wav_file_t *wav = &wav_files[track_idx];
+    if (!parse_wav_header(current_file, wav)) {
+        fclose(current_file);
+        current_file = NULL;
+        return;
+    }
+    
+    // Reconfigure I2S clock for this file's sample rate
+    i2s_channel_disable(tx_handle);
+    
+    i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(wav->sample_rate);
+    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg));
+    
+    i2s_channel_enable(tx_handle);
+    
+    // Update UI
+    lv_label_set_text(title_label, wav->name);
+    
+    // Reset progress bar and time
+    if (progress_bar) {
+        lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
+    }
+    if (time_label) {
+        lv_label_set_text(time_label, "00:00");
+    }
+    
+    // Update total time
+    if (time_total_label && wav->sample_rate > 0) {
+        uint32_t total_seconds = wav->data_size / 
+            (wav->sample_rate * wav->num_channels * (wav->bits_per_sample / 8));
+        uint32_t minutes = total_seconds / 60;
+        uint32_t seconds = total_seconds % 60;
+        char time_text[16];
+        snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+        lv_label_set_text(time_total_label, time_text);
+    }
+    
+    // Start playback
+    is_playing = true;
+    is_paused = false;
+    seek_position = 0;  // Clear any pending seek
+    
+    xTaskCreate(audio_playback_task, "audio_task", 4096, NULL, 5, &audio_task_handle);
+    
+    ESP_LOGI(TAG, "Started playing: %s", filename);
+}
+
+// Load a track and update UI but don't start playback
+void audio_player_load(const char *filename)
+{
+    audio_player_stop();
+    
+    // Find the file in our list
+    int track_idx = -1;
+    for (int i = 0; i < wav_file_count; i++) {
+        if (strcmp(wav_files[i].name, filename) == 0) {
+            track_idx = i;
+            break;
+        }
+    }
+    
+    if (track_idx < 0) {
+        ESP_LOGE(TAG, "File not found in playlist: %s", filename);
+        return;
+    }
+    
+    current_track = track_idx;
+    wav_file_t *wav = &wav_files[track_idx];
+    
+    // Update UI only
+    lv_label_set_text(title_label, wav->name);
+    
+    // Reset progress bar and time
+    if (progress_bar) {
+        lv_bar_set_value(progress_bar, 0, LV_ANIM_OFF);
+    }
+    if (time_label) {
+        lv_label_set_text(time_label, "00:00");
+    }
+    
+    // Update total time
+    if (time_total_label && wav->sample_rate > 0) {
+        uint32_t total_seconds = wav->data_size / 
+            (wav->sample_rate * wav->num_channels * (wav->bits_per_sample / 8));
+        uint32_t minutes = total_seconds / 60;
+        uint32_t seconds = total_seconds % 60;
+        char time_text[16];
+        snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+        lv_label_set_text(time_total_label, time_text);
+    }
+    
+    ESP_LOGI(TAG, "Loaded track: %s", filename);
+}
+
+void audio_player_stop(void)
+{
+    is_playing = false;
+    is_paused = false;
+    
+    if (audio_task_handle) {
+        vTaskDelay(pdMS_TO_TICKS(200));  // Wait for task to finish
+        audio_task_handle = NULL;
+    }
+    
+    if (current_file) {
+        fclose(current_file);
+        current_file = NULL;
+    }
+    
+    current_track = -1;
+}
+
+void audio_player_pause(void)
+{
+    is_paused = true;
+}
+
+void audio_player_resume(void)
+{
+    is_paused = false;
+}
+
+void audio_player_next(void)
+{
+    if (wav_file_count == 0) return;
+    
+    int next_track = (current_track + 1) % wav_file_count;
+    
+    // Respect auto-play setting
+    if (auto_play_enabled || is_playing || is_paused) {
+        audio_player_play(wav_files[next_track].name);
+    } else {
+        audio_player_load(wav_files[next_track].name);
+    }
+}
+
+void audio_player_previous(void)
+{
+    if (wav_file_count == 0) return;
+    
+    int prev_track = (current_track - 1 + wav_file_count) % wav_file_count;
+    
+    // Respect auto-play setting
+    if (auto_play_enabled || is_playing || is_paused) {
+        audio_player_play(wav_files[prev_track].name);
+    } else {
+        audio_player_load(wav_files[prev_track].name);
+    }
+}
+
+bool audio_player_is_playing(void)
+{
+    return is_playing && !is_paused;
+}
+
+void audio_player_show(void)
+{
+    // Check if auto-play is enabled and not already playing
+    if (auto_play_enabled && !is_playing && !is_paused && wav_file_count > 0) {
+        ESP_LOGI(TAG, "Auto-play enabled, starting first track");
+        audio_player_play(wav_files[0].name);
+    }
 }

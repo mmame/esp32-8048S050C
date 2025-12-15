@@ -801,6 +801,7 @@ void file_manager_hide(void)
         lv_obj_t *audio_screen = audio_player_get_screen();
         if (audio_screen) {
             lv_screen_load(audio_screen);
+            audio_player_show();  // Trigger auto-play if enabled
             ESP_LOGI(TAG, "Returned to audio player");
         }
     }

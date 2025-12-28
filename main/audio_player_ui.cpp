@@ -11,15 +11,17 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <math.h>
 
 static const char *TAG = "AudioPlayer";
 
 #define TRANSITION_IGNORE_MS 300  // Ignore events for 300ms after screen transition
 #define MAX_AUDIO_FILES 50
 #define MAX_FILENAME_LEN 64
-#define I2S_BUFFER_SIZE 1024
+#define I2S_BUFFER_SIZE 8192  // 8KB I2S DMA buffer
+#define SDCARD_BUFFER_SIZE 32768  // 32KB buffer for SD card file reads
 #define WAV_HEADER_SIZE 44
-#define MP3_BUFFER_SIZE 4096  // Max MP3 frame size (increased for safety)
+#define MP3_BUFFER_SIZE 8192  // Max MP3 frame size (increased for safety)
 #define NVS_NAMESPACE "audio_player"
 
 // Audio file types
@@ -57,6 +59,8 @@ static volatile uint32_t seek_position = 0;  // Byte position to seek to (0 = no
 static uint32_t wav_data_start_offset = 0;   // Offset in file where WAV data starts
 static bool auto_play_enabled = false;       // Auto-play on screen show
 static bool continue_playback_enabled = false; // Continue to next track when finished
+static uint8_t volume_level = 80;            // Volume level (0-100), default 80%
+static uint8_t *file_buffer = NULL;          // Buffer for SD card file reads
 
 // Stats overlay
 static lv_obj_t * cpu_label = NULL;
@@ -71,6 +75,7 @@ static lv_obj_t * time_label = NULL;
 static lv_obj_t * time_total_label = NULL;
 static lv_obj_t * autoplay_checkbox = NULL;
 static lv_obj_t * continue_checkbox = NULL;
+static lv_obj_t * volume_slider = NULL;
 static lv_obj_t * audio_player_screen = NULL;
 
 // Forward declarations
@@ -81,8 +86,69 @@ static void btn_next_event_cb(lv_event_t *e);
 static void progress_bar_event_cb(lv_event_t *e);
 static void autoplay_checkbox_event_cb(lv_event_t *e);
 static void continue_checkbox_event_cb(lv_event_t *e);
+static void volume_slider_event_cb(lv_event_t *e);
 static void load_audio_config(void);
 static void save_audio_config(void);
+
+// Test: Generate 1kHz sine wave - NS4168 MONO test
+static void test_sine_wave_task(void *arg)
+{
+    const uint32_t sample_rate = 44100;
+    const float frequency = 1000.0f;  // 1kHz
+    const float amplitude = 0.05f;     // 5% für Test
+    const size_t buffer_samples = 1024;
+    
+    // STEREO buffer - 2 samples per frame (L+R) for NS4168
+    int16_t *buffer = (int16_t *)heap_caps_malloc(buffer_samples * 2 * sizeof(int16_t), MALLOC_CAP_DMA);
+    if (!buffer) {
+        ESP_LOGE(TAG, "Failed to allocate sine wave buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Use float phase for proper precision and wrapping
+    const float phase_increment = 2.0f * 3.14159265359f * frequency / sample_rate;
+    float phase = 0.0f;
+    
+    ESP_LOGI(TAG, "Generating 1kHz sine wave at 5%% - STEREO for NS4168 (mono output)...");
+    
+    while (is_playing) {
+        if (is_paused) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        
+        // STEREO mode - 2 samples per frame (L+R)
+        // NS4168 expects stereo input, outputs mono (mixes L+R internally)
+        for (size_t i = 0; i < buffer_samples; i++) {
+            int16_t sample = (int16_t)(sinf(phase) * 32767.0f * amplitude);
+            
+            // Fill both channels with same signal (stereo input, mono output)
+            buffer[i * 2] = sample;      // Left channel
+            buffer[i * 2 + 1] = sample;  // Right channel (NS4168 mixes L+R to mono)
+            
+            // Increment phase and wrap properly
+            phase += phase_increment;
+            if (phase >= 6.28318530718f) {  // 2*PI
+                phase -= 6.28318530718f;
+            }
+        }
+        
+        // Write to I2S - STEREO buffer
+        size_t bytes_written;
+        i2s_channel_write(tx_handle, (uint8_t*)buffer, buffer_samples * 2 * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+    }
+    
+    // Disable I2S to silence DAC output
+    if (tx_handle) {
+        i2s_channel_disable(tx_handle);
+    }
+    
+    free(buffer);
+    audio_task_handle = NULL;
+    ESP_LOGI(TAG, "Sine wave test stopped");
+    vTaskDelete(NULL);
+}
 
 static void update_stats_timer_cb(lv_timer_t * timer)
 {
@@ -324,6 +390,24 @@ void audio_player_ui_init(lv_display_t * disp)
     lv_obj_set_style_bg_color(continue_checkbox, lv_color_hex(0x00AA00), LV_PART_INDICATOR);
     lv_obj_add_event_cb(continue_checkbox, continue_checkbox_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     
+    // Create Volume slider (bottom-right, vertical)
+    volume_slider = lv_slider_create(screen);
+    lv_obj_set_size(volume_slider, 40, 200);
+    lv_obj_align(volume_slider, LV_ALIGN_BOTTOM_RIGHT, -20, -80);
+    lv_slider_set_range(volume_slider, 0, 100);
+    lv_slider_set_value(volume_slider, volume_level, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(volume_slider, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_color(volume_slider, lv_color_hex(0x00AA00), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(volume_slider, lv_color_hex(0x00FF00), LV_PART_KNOB);
+    lv_obj_add_event_cb(volume_slider, volume_slider_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    // Create volume label
+    lv_obj_t * volume_label = lv_label_create(screen);
+    lv_label_set_text(volume_label, LV_SYMBOL_VOLUME_MAX);
+    lv_obj_set_style_text_font(volume_label, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(volume_label, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_align_to(volume_label, volume_slider, LV_ALIGN_OUT_BOTTOM_MID, 0, 5);
+    
     // Create CPU label (bottom-right corner for debugging)
     cpu_label = lv_label_create(screen);
     lv_obj_set_style_text_color(cpu_label, lv_color_hex(0x00FF00), 0);
@@ -405,8 +489,11 @@ static void load_audio_config(void)
         nvs_get_u8(nvs_handle, "continue_play", &continue_play);
         continue_playback_enabled = (continue_play != 0);
         
+        nvs_get_u8(nvs_handle, "volume", &volume_level);
+        if (volume_level > 100) volume_level = 80;  // Sanity check
+        
         nvs_close(nvs_handle);
-        ESP_LOGI(TAG, "Loaded audio config: auto_play=%d, continue_play=%d", auto_play_enabled, continue_playback_enabled);
+        ESP_LOGI(TAG, "Loaded audio config: auto_play=%d, continue_play=%d, volume=%d", auto_play_enabled, continue_playback_enabled, volume_level);
     } else {
         ESP_LOGI(TAG, "No saved audio config, using defaults");
     }
@@ -420,6 +507,7 @@ static void save_audio_config(void)
     if (err == ESP_OK) {
         nvs_set_u8(nvs_handle, "auto_play", auto_play_enabled ? 1 : 0);
         nvs_set_u8(nvs_handle, "continue_play", continue_playback_enabled ? 1 : 0);
+        nvs_set_u8(nvs_handle, "volume", volume_level);
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
         ESP_LOGI(TAG, "Saved audio config");
@@ -450,6 +538,17 @@ static void continue_checkbox_event_cb(lv_event_t *e)
     }
 }
 
+static void volume_slider_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_VALUE_CHANGED) {
+        lv_obj_t *slider = (lv_obj_t *)lv_event_get_target(e);
+        volume_level = lv_slider_get_value(slider);
+        ESP_LOGI(TAG, "Volume set to %d%%", volume_level);
+        save_audio_config();
+    }
+}
+
 // ========== Button Event Handlers ==========
 
 static void btn_prev_event_cb(lv_event_t *e)
@@ -471,11 +570,18 @@ static void btn_play_event_cb(lv_event_t *e)
         } else if (is_paused) {
             audio_player_resume();
         } else {
-            // Start playing current track (or first track if none selected)
+            // Play audio files (normal mode)
             if (wav_file_count > 0) {
                 int track = (current_track >= 0 && current_track < wav_file_count) ? current_track : 0;
                 audio_player_play(audio_files[track].name);
             }
+            
+            // TEST CODE (disabled - uncomment to test sine wave):
+            // ESP_LOGI(TAG, "Starting SINE WAVE test (1kHz @ 0.01%)");
+            // is_playing = true;
+            // is_paused = false;
+            // lv_label_set_text(title_label, "TEST: DC+Sine (no zero cross)");
+            // xTaskCreate(test_sine_wave_task, "sine_test", 8192, NULL, 10, &audio_task_handle);
         }
     }
 }
@@ -578,6 +684,7 @@ static bool parse_wav_header(FILE *file, audio_file_t *wav_info)
 // Audio playback task
 static void audio_playback_task(void *arg)
 {
+    file_buffer = (uint8_t *)heap_caps_malloc(SDCARD_BUFFER_SIZE, MALLOC_CAP_SPIRAM);
     uint8_t *buffer = (uint8_t *)heap_caps_malloc(I2S_BUFFER_SIZE, MALLOC_CAP_DMA);
     uint8_t *mp3_buffer = NULL;
     mp3dec_t *mp3_decoder = NULL;  // Allocate on heap, decoder is ~6KB
@@ -606,7 +713,7 @@ static void audio_playback_task(void *arg)
         ESP_LOGI(TAG, "Allocating MP3 buffers: mp3_buffer=%d, decoder=%d, pcm=%d", 
                  MP3_BUFFER_SIZE, sizeof(mp3dec_t), MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
         
-        mp3_buffer = (uint8_t *)heap_caps_malloc(MP3_BUFFER_SIZE, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        mp3_buffer = (uint8_t *)heap_caps_malloc(MP3_BUFFER_SIZE, MALLOC_CAP_INTERNAL);
         if (!mp3_buffer) {
             ESP_LOGE(TAG, "Failed to allocate MP3 buffer");
             free(buffer);
@@ -616,7 +723,7 @@ static void audio_playback_task(void *arg)
         memset(mp3_buffer, 0, MP3_BUFFER_SIZE);  // Zero to ensure proper mapping
         ESP_LOGI(TAG, "MP3 buffer allocated at %p", mp3_buffer);
         
-        mp3_decoder = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        mp3_decoder = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_INTERNAL);
         if (!mp3_decoder) {
             ESP_LOGE(TAG, "Failed to allocate MP3 decoder (~6KB)");
             free(mp3_buffer);
@@ -629,7 +736,7 @@ static void audio_playback_task(void *arg)
         
         // Allocate PCM buffer with extra safety margin
         size_t pcm_size = MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t) + 64;  // +64 bytes safety
-        pcm_buffer = (int16_t *)heap_caps_malloc(pcm_size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        pcm_buffer = (int16_t *)heap_caps_malloc(pcm_size, MALLOC_CAP_INTERNAL);
         if (!pcm_buffer) {
             ESP_LOGE(TAG, "Failed to allocate PCM buffer");
             free(mp3_decoder);
@@ -718,16 +825,11 @@ static void audio_playback_task(void *arg)
                         
                         // Convert to PCM bytes for display
                         bytes_played = elapsed_seconds * bytes_per_second;
-                        
-                        ESP_LOGI(TAG, "MP3 seeked to %lu%% (%lu/%lu bytes), elapsed: %lu/%lu sec, PCM bytes: %lu",
-                                (seek_pos * 100) / mp3_file_size, seek_pos, mp3_file_size,
-                                elapsed_seconds, total_duration_seconds, bytes_played);
                     } else {
                         bytes_played = 0;
-                        ESP_LOGI(TAG, "MP3 seeked to file position %lu bytes (no duration estimate yet)", seek_pos);
                     }
                     
-                    ESP_LOGI(TAG, "Post-seek state: buffer_pos=%lu, buffer_len=%lu, file_pos=%lu", mp3_buffer_pos, mp3_buffer_len, mp3_file_pos);
+                    ESP_LOGD(TAG, "Post-seek state: buffer_pos=%lu, buffer_len=%lu, file_pos=%lu", mp3_buffer_pos, mp3_buffer_len, mp3_file_pos);
                 } else {
                     ESP_LOGE(TAG, "MP3 seek failed");
                 }
@@ -739,10 +841,19 @@ static void audio_playback_task(void *arg)
         size_t bytes_written = 0;
         
         if (audio->type == AUDIO_TYPE_WAV) {
-            // WAV: Read PCM data directly
+            // WAV: Simple read and write
             size_t bytes_read = fread(buffer, 1, I2S_BUFFER_SIZE, current_file);
             
             if (bytes_read > 0) {
+                // Apply volume scaling only if needed (treat buffer as 16-bit samples)
+                if (volume_level < 100) {
+                    int16_t *samples = (int16_t *)buffer;
+                    size_t sample_count = bytes_read / 2;
+                    for (size_t i = 0; i < sample_count; i++) {
+                        samples[i] = (samples[i] * volume_level) / 100;
+                    }
+                }
+                
                 i2s_channel_write(tx_handle, buffer, bytes_read, &bytes_written, portMAX_DELAY);
                 bytes_played += bytes_written;
             } else {
@@ -753,8 +864,8 @@ static void audio_playback_task(void *arg)
             // MP3: Decode frames to PCM
             ESP_LOGD(TAG, "MP3 decode loop: buffer_pos=%lu, buffer_len=%lu, file_pos=%lu", mp3_buffer_pos, mp3_buffer_len, mp3_file_pos);
             
-            // Read more MP3 data if buffer is low
-            if (mp3_buffer_len - mp3_buffer_pos < MINIMP3_MAX_SAMPLES_PER_FRAME) {
+            // Read more MP3 data aggressively - when buffer is less than half full
+            if (mp3_buffer_len - mp3_buffer_pos < MP3_BUFFER_SIZE / 2) {
                 ESP_LOGD(TAG, "MP3 buffer low, will try to read more data");
                 if (mp3_buffer_pos > 0) {
                     // Move remaining data to start of buffer
@@ -794,11 +905,21 @@ static void audio_playback_task(void *arg)
                             mp3_bitrate_kbps = frame_info.bitrate_kbps;
                         }
                         
-                        // Reconfigure I2S
+                        // Reconfigure I2S completely (clock and slot configuration)
                         ESP_LOGI(TAG, "MP3 format: %d Hz, %d ch", frame_info.hz, frame_info.channels);
                         i2s_channel_disable(tx_handle);
+                        
+                        // Update clock
                         i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(audio->sample_rate);
-                        i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
+                        ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg));
+                        
+                        // Update slot configuration (stereo/mono may have changed)
+                        i2s_std_slot_config_t slot_cfg = I2S_STD_PCM_SLOT_DEFAULT_CONFIG(
+                            I2S_DATA_BIT_WIDTH_16BIT,
+                            I2S_SLOT_MODE_STEREO  // Always stereo for NS4168
+                        );
+                        ESP_ERROR_CHECK(i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg));
+                        
                         i2s_channel_enable(tx_handle);
                         
                         // Update total time label now that we know the format
@@ -832,6 +953,15 @@ static void audio_playback_task(void *arg)
                             ESP_LOGE(TAG, "Heap corruption detected during PCM overflow!");
                         }
                     }
+                    
+                    // Apply volume scaling only if needed
+                    if (volume_level < 100) {
+                        size_t sample_count = pcm_bytes / 2;
+                        for (size_t i = 0; i < sample_count; i++) {
+                            pcm_buffer[i] = (pcm_buffer[i] * volume_level) / 100;
+                        }
+                    }
+                    
                     i2s_channel_write(tx_handle, (uint8_t*)pcm_buffer, pcm_bytes, &bytes_written, portMAX_DELAY);
                     bytes_played += bytes_written;
                     
@@ -865,9 +995,9 @@ static void audio_playback_task(void *arg)
         // Check if we wrote any data
         ESP_LOGD(TAG, "Checking bytes_written: %zu (type=%d)", bytes_written, audio->type);
         if (bytes_written > 0) {
-            // Update UI every 200ms to avoid excessive locking
+            // Update UI every 500ms to minimize lock contention
             uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            if (now - last_update_time >= 200) {
+            if (now - last_update_time >= 500) {
                 last_update_time = now;
                 
                 // Calculate progress
@@ -889,7 +1019,7 @@ static void audio_playback_task(void *arg)
                 uint32_t minutes = elapsed_seconds / 60;
                 uint32_t seconds = elapsed_seconds % 60;
                 
-                // Update UI with LVGL lock
+                // Update UI with LVGL lock - keep it brief
                 lv_lock();
                 if (progress_bar) {
                     lv_bar_set_value(progress_bar, progress, LV_ANIM_OFF);
@@ -928,28 +1058,55 @@ static void audio_playback_task(void *arg)
                 audio_file_t *next_audio = &audio_files[current_track];
                 current_file = fopen(next_audio->path, "rb");
                 
+                // Enable full buffering for SD card reads
+                if (current_file) {
+                    setvbuf(current_file, (char*)file_buffer, _IOFBF, SDCARD_BUFFER_SIZE);
+                }
+                
                 bool next_ok = false;
                 if (current_file) {
                     if (next_audio->type == AUDIO_TYPE_WAV) {
+                        // Switching to WAV - free MP3 buffers if they exist
+                        if (mp3_buffer) {
+                            free(mp3_buffer);
+                            mp3_buffer = NULL;
+                        }
+                        if (mp3_decoder) {
+                            free(mp3_decoder);
+                            mp3_decoder = NULL;
+                        }
+                        if (pcm_buffer) {
+                            free(pcm_buffer);
+                            pcm_buffer = NULL;
+                        }
+                        ESP_LOGI(TAG, "Freed MP3 buffers, switching to WAV");
+                        
                         next_ok = parse_wav_header(current_file, next_audio);
                     } else if (next_audio->type == AUDIO_TYPE_MP3) {
-                        // MP3 files don't need header parsing here
-                        // Allocate MP3 buffers if needed
-                        if (!mp3_decoder) {
-                            mp3_decoder = (mp3dec_t *)malloc(sizeof(mp3dec_t));
-                        }
-                        if (!mp3_buffer) {
-                            mp3_buffer = (uint8_t *)malloc(MP3_BUFFER_SIZE);
-                        }
-                        if (!pcm_buffer) {
-                            pcm_buffer = (int16_t *)malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
-                        }
+                        // Switching to MP3 - ensure fresh buffers
+                        ESP_LOGI(TAG, "Switching to MP3, allocating fresh buffers");
+                        
+                        // Free old buffers if they exist
+                        if (mp3_buffer) free(mp3_buffer);
+                        if (mp3_decoder) free(mp3_decoder);
+                        if (pcm_buffer) free(pcm_buffer);
+                        
+                        // Allocate fresh MP3 buffers
+                        mp3_decoder = (mp3dec_t *)heap_caps_malloc(sizeof(mp3dec_t), MALLOC_CAP_INTERNAL);
+                        mp3_buffer = (uint8_t *)heap_caps_malloc(MP3_BUFFER_SIZE, MALLOC_CAP_INTERNAL);
+                        pcm_buffer = (int16_t *)heap_caps_malloc(MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t), MALLOC_CAP_INTERNAL);
                         
                         if (mp3_decoder && mp3_buffer && pcm_buffer) {
+                            // Zero buffers for clean state
+                            memset(mp3_buffer, 0, MP3_BUFFER_SIZE);
+                            memset(mp3_decoder, 0, sizeof(mp3dec_t));
+                            memset(pcm_buffer, 0, MINIMP3_MAX_SAMPLES_PER_FRAME * 2 * sizeof(int16_t));
+                            
                             mp3dec_init(mp3_decoder);
                             mp3_buffer_pos = 0;
                             mp3_buffer_len = 0;
                             mp3_file_pos = 0;
+                            mp3_total_time_updated = false;
                             // Get file size for new MP3 track
                             fseek(current_file, 0, SEEK_END);
                             mp3_file_size = ftell(current_file);
@@ -966,11 +1123,28 @@ static void audio_playback_task(void *arg)
                     // Update audio pointer
                     audio = next_audio;
                     
-                    // Reconfigure I2S for new sample rate if needed
+                    // Flush I2S DMA buffers to prevent audio garbage from previous track
                     i2s_channel_disable(tx_handle);
+                    vTaskDelay(pdMS_TO_TICKS(50));  // Wait for DMA to fully stop
+                    
+                    // Update clock configuration
                     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(audio->sample_rate);
-                    i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
+                    ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg));
+                    
+                    // Update slot configuration (stereo/mono may have changed between MP3 and WAV)
+                    i2s_std_slot_config_t slot_cfg = I2S_STD_PCM_SLOT_DEFAULT_CONFIG(
+                        I2S_DATA_BIT_WIDTH_16BIT, 
+                        I2S_SLOT_MODE_STEREO  // Always stereo for NS4168
+                    );
+                    ESP_ERROR_CHECK(i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg));
+                    
                     i2s_channel_enable(tx_handle);
+                    
+                    // Small delay to let I2S stabilize after reconfiguration
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    
+                    ESP_LOGI(TAG, "I2S reconfigured: %lu Hz, %d ch, %d bit", 
+                             audio->sample_rate, audio->num_channels, audio->bits_per_sample);
                     
                     // Update UI
                     lv_lock();
@@ -1021,6 +1195,11 @@ static void audio_playback_task(void *arg)
         }
     }
     
+    // Disable I2S to silence DAC output
+    if (tx_handle) {
+        i2s_channel_disable(tx_handle);
+    }
+    
     free(buffer);
     if (mp3_buffer) {
         free(mp3_buffer);
@@ -1040,7 +1219,18 @@ void audio_player_init_i2s(void)
 {
     ESP_LOGI(TAG, "Initializing I2S...");
     
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    // Increase DMA buffer count and size for smoother audio
+    i2s_chan_config_t chan_cfg = {
+        .id = I2S_NUM_0,
+        .role = I2S_ROLE_MASTER,
+        .dma_desc_num = 8,      // Increased from default 6
+        .dma_frame_num = 1024,   // Increased from default 240
+        .auto_clear = true,
+        .auto_clear_before_cb = false,
+        .allow_pd = false,
+        .intr_priority = 0,
+    };
+
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &tx_handle, NULL));
     
     i2s_std_config_t std_cfg = {
@@ -1073,9 +1263,9 @@ void audio_player_scan_wav_files(void)
     
     // Allocate audio files array on heap if not already allocated
     if (!audio_files) {
-        audio_files = (audio_file_t *)heap_caps_malloc(MAX_AUDIO_FILES * sizeof(audio_file_t), MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+        audio_files = (audio_file_t *)heap_caps_malloc(MAX_AUDIO_FILES * sizeof(audio_file_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!audio_files) {
-            ESP_LOGE(TAG, "Failed to allocate audio files array (~40KB) from internal RAM");
+            ESP_LOGE(TAG, "Failed to allocate audio files array (~40KB) from PSRAM");
             return;
         }
         memset(audio_files, 0, MAX_AUDIO_FILES * sizeof(audio_file_t));  // Zero to ensure proper mapping
@@ -1227,6 +1417,10 @@ void audio_player_play(const char *filename)
         return;
     }
     
+    // Enable full buffering with large buffer to smooth SD card read latency
+    setvbuf(current_file, (char*)file_buffer, _IOFBF, SDCARD_BUFFER_SIZE);
+    ESP_LOGI(TAG, "File buffering enabled: %d bytes", sizeof(file_buffer));
+    
     // Parse header for WAV files only
     if (audio->type == AUDIO_TYPE_WAV) {
         if (!parse_wav_header(current_file, audio)) {
@@ -1236,13 +1430,22 @@ void audio_player_play(const char *filename)
         }
     }
     
-    // Reconfigure I2S clock for this file's sample rate
+    // Flush and reconfigure I2S for this file's format
     i2s_channel_disable(tx_handle);
+    vTaskDelay(pdMS_TO_TICKS(50));  // Wait for DMA to fully stop and flush
     
     i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(audio->sample_rate);
     ESP_ERROR_CHECK(i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg));
     
+    // Reconfigure slot configuration (ensures proper stereo/mono handling)
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PCM_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_16BIT,
+        I2S_SLOT_MODE_STEREO  // Always stereo for NS4168
+    );
+    ESP_ERROR_CHECK(i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg));
+    
     i2s_channel_enable(tx_handle);
+    vTaskDelay(pdMS_TO_TICKS(10));  // Let I2S stabilize
     
     // Update UI
     const char *type_str = audio->type == AUDIO_TYPE_MP3 ? "MP3" : "WAV";
@@ -1298,8 +1501,9 @@ void audio_player_play(const char *filename)
     is_paused = false;
     seek_position = 0;  // Clear any pending seek
     
-    // Larger stack for MP3 decoding (deep call chains + LVGL)
-    xTaskCreate(audio_playback_task, "audio_task", 16384, NULL, 5, &audio_task_handle);
+    // Larger stack for MP3 decoding + bigger buffers
+    // Higher priority (10) to minimize audio glitches
+    xTaskCreate(audio_playback_task, "audio_task", 20480, NULL, 10, &audio_task_handle);
     
     ESP_LOGI(TAG, "Started playing: %s", filename);
 }
@@ -1380,6 +1584,11 @@ void audio_player_stop(void)
     is_playing = false;
     is_paused = false;
     
+    // Disable I2S to silence DAC output
+    if (tx_handle) {
+        i2s_channel_disable(tx_handle);
+    }
+    
     if (audio_task_handle) {
         // Wait for task to actually finish (it will set handle to NULL)
         int timeout = 50;  // 50 * 20ms = 1 second max
@@ -1404,10 +1613,20 @@ void audio_player_stop(void)
 void audio_player_pause(void)
 {
     is_paused = true;
+    
+    // Disable I2S to silence DAC output
+    if (tx_handle) {
+        i2s_channel_disable(tx_handle);
+    }
 }
 
 void audio_player_resume(void)
 {
+    // Re-enable I2S before resuming
+    if (tx_handle) {
+        i2s_channel_enable(tx_handle);
+    }
+    
     is_paused = false;
 }
 

@@ -657,6 +657,18 @@ static void audio_playback_task(void *arg)
     uint32_t last_update_time = 0;
     uint32_t mp3_buffer_pos = 0;
     uint32_t mp3_buffer_len = 0;
+    uint32_t mp3_file_pos = 0;  // Track actual file position for MP3
+    uint32_t mp3_file_size = 0;  // Total file size for MP3
+    bool mp3_total_time_updated = false;  // Track if we've calculated actual MP3 duration
+    
+    // For MP3 files, get the file size for progress calculation
+    if (audio->type == AUDIO_TYPE_MP3) {
+        fseek(current_file, 0, SEEK_END);
+        mp3_file_size = ftell(current_file);
+        fseek(current_file, 0, SEEK_SET);
+        total_bytes = mp3_file_size;  // Use file size as total for progress
+        ESP_LOGI(TAG, "MP3 file size: %lu bytes", mp3_file_size);
+    }
     
     while (is_playing) {
         if (is_paused) {
@@ -732,6 +744,7 @@ static void audio_playback_task(void *arg)
                                          MP3_BUFFER_SIZE - mp3_buffer_len, current_file);
                 if (bytes_read > 0) {
                     mp3_buffer_len += bytes_read;
+                    mp3_file_pos += bytes_read;  // Track file position
                 }
             }
             
@@ -754,6 +767,21 @@ static void audio_playback_task(void *arg)
                         i2s_std_clk_config_t clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(audio->sample_rate);
                         i2s_channel_reconfig_std_clock(tx_handle, &clk_cfg);
                         i2s_channel_enable(tx_handle);
+                        
+                        // Update total time label now that we know the format
+                        if (!mp3_total_time_updated && time_total_label && frame_info.bitrate_kbps > 0) {
+                            // Estimate duration: (file_size_bytes * 8) / (bitrate_kbps * 1000)
+                            uint32_t estimated_seconds = (mp3_file_size * 8) / (frame_info.bitrate_kbps * 1000);
+                            uint32_t minutes = estimated_seconds / 60;
+                            uint32_t seconds = estimated_seconds % 60;
+                            char time_text[16];
+                            snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+                            lv_lock();
+                            lv_label_set_text(time_total_label, time_text);
+                            lv_unlock();
+                            mp3_total_time_updated = true;
+                            ESP_LOGI(TAG, "MP3 estimated duration: %02lu:%02lu (bitrate: %d kbps)", minutes, seconds, frame_info.bitrate_kbps);
+                        }
                     }
                     
                     // Write PCM samples to I2S
@@ -804,15 +832,22 @@ static void audio_playback_task(void *arg)
             if (now - last_update_time >= 200) {
                 last_update_time = now;
                 
-                // Calculate progress (for MP3, estimate if total unknown)
+                // Calculate progress
                 uint32_t progress = 0;
-                if (total_bytes > 0) {
+                if (audio->type == AUDIO_TYPE_MP3 && mp3_file_size > 0) {
+                    // For MP3, use file position vs file size
+                    progress = (mp3_file_pos * 100) / mp3_file_size;
+                } else if (total_bytes > 0) {
+                    // For WAV, use bytes played vs total bytes
                     progress = (bytes_played * 100) / total_bytes;
-                    if (progress > 100) progress = 100;
                 }
+                if (progress > 100) progress = 100;
                 
-                // Calculate elapsed time
-                uint32_t elapsed_seconds = bytes_played / bytes_per_second;
+                // Calculate elapsed time (based on PCM bytes output)
+                uint32_t elapsed_seconds = 0;
+                if (bytes_per_second > 0) {
+                    elapsed_seconds = bytes_played / bytes_per_second;
+                }
                 uint32_t minutes = elapsed_seconds / 60;
                 uint32_t seconds = elapsed_seconds % 60;
                 
@@ -876,6 +911,11 @@ static void audio_playback_task(void *arg)
                             mp3dec_init(mp3_decoder);
                             mp3_buffer_pos = 0;
                             mp3_buffer_len = 0;
+                            mp3_file_pos = 0;
+                            // Get file size for new MP3 track
+                            fseek(current_file, 0, SEEK_END);
+                            mp3_file_size = ftell(current_file);
+                            fseek(current_file, 0, SEEK_SET);
                             next_ok = true;
                         } else {
                             ESP_LOGE(TAG, "Failed to allocate MP3 buffers for next track");
@@ -923,7 +963,7 @@ static void audio_playback_task(void *arg)
                     
                     // Reset playback state for new track
                     bytes_per_second = audio->sample_rate * audio->num_channels * (audio->bits_per_sample / 8);
-                    total_bytes = audio->data_size;
+                    total_bytes = audio->type == AUDIO_TYPE_MP3 ? mp3_file_size : audio->data_size;
                     bytes_played = 0;
                     seek_position = 0;
                     
@@ -1174,6 +1214,25 @@ void audio_player_play(const char *filename)
             char time_text[16];
             snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
             lv_label_set_text(time_total_label, time_text);
+        } else if (audio->type == AUDIO_TYPE_MP3) {
+            // Estimate MP3 duration assuming 192 kbps average bitrate
+            FILE *f = fopen(audio->path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long file_size = ftell(f);
+                fclose(f);
+                
+                // duration = (file_size_bytes * 8) / (bitrate_bps)
+                // Using 192 kbps as default estimate
+                uint32_t estimated_seconds = (file_size * 8) / (192 * 1000);
+                uint32_t minutes = estimated_seconds / 60;
+                uint32_t seconds = estimated_seconds % 60;
+                char time_text[16];
+                snprintf(time_text, sizeof(time_text), "~%02lu:%02lu", minutes, seconds);
+                lv_label_set_text(time_total_label, time_text);
+            } else {
+                lv_label_set_text(time_total_label, "--:--");
+            }
         } else {
             lv_label_set_text(time_total_label, "--:--");
         }
@@ -1237,8 +1296,24 @@ void audio_player_load(const char *filename)
             char time_text[16];
             snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
             lv_label_set_text(time_total_label, time_text);
-        } else {
-            lv_label_set_text(time_total_label, "--:--");
+        } else if (audio->type == AUDIO_TYPE_MP3) {
+            // Estimate MP3 duration assuming 192 kbps average bitrate
+            FILE *f = fopen(audio->path, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                long file_size = ftell(f);
+                fclose(f);
+                
+                // duration = (file_size_bytes * 8) / (bitrate_bps)
+                uint32_t estimated_seconds = (file_size * 8) / (192 * 1000);
+                uint32_t minutes = estimated_seconds / 60;
+                uint32_t seconds = estimated_seconds % 60;
+                char time_text[16];
+                snprintf(time_text, sizeof(time_text), "~%02lu:%02lu", minutes, seconds);
+                lv_label_set_text(time_total_label, time_text);
+            } else {
+                lv_label_set_text(time_total_label, "--:--");
+            }
         }
     }
     

@@ -19,7 +19,7 @@ static const char *TAG = "AudioPlayer";
 #define MAX_AUDIO_FILES 50
 #define MAX_FILENAME_LEN 64
 #define I2S_BUFFER_SIZE 8192  // 8KB I2S DMA buffer
-#define SDCARD_BUFFER_SIZE 32768  // 32KB buffer for SD card file reads
+#define SDCARD_BUFFER_SIZE 16384  // 16KB buffer for SD card file reads
 #define WAV_HEADER_SIZE 44
 #define MP3_BUFFER_SIZE 8192  // Max MP3 frame size (increased for safety)
 #define NVS_NAMESPACE "audio_player"

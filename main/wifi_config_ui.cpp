@@ -338,6 +338,13 @@ static void url_decode(char *dst, const char *src) {
     *dst++ = '\0';
 }
 
+// Structure for sorting files in web browser
+typedef struct {
+    char name[256];
+    bool is_dir;
+    long size;
+} web_file_entry_t;
+
 static esp_err_t list_get_handler(httpd_req_t *req)
 {
     // Set CORS headers
@@ -366,13 +373,17 @@ static esp_err_t list_get_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     
-    // Start JSON response
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_sendstr_chunk(req, "{\"files\":[");
+    // Collect all files first for sorting
+    web_file_entry_t *file_list = (web_file_entry_t *)malloc(256 * sizeof(web_file_entry_t));
+    if (!file_list) {
+        closedir(dir);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Out of memory");
+        return ESP_FAIL;
+    }
     
+    int file_count = 0;
     struct dirent *entry;
-    bool first = true;
-    while ((entry = readdir(dir)) != NULL) {
+    while ((entry = readdir(dir)) != NULL && file_count < 256) {
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
             continue;
         }
@@ -389,19 +400,59 @@ static esp_err_t list_get_handler(httpd_req_t *req)
             size = st.st_size;
         }
         
-        if (!first) {
+        strncpy(file_list[file_count].name, entry->d_name, sizeof(file_list[file_count].name) - 1);
+        file_list[file_count].name[sizeof(file_list[file_count].name) - 1] = '\0';
+        file_list[file_count].is_dir = is_dir;
+        file_list[file_count].size = size;
+        file_count++;
+    }
+    closedir(dir);
+    
+    // Sort files alphabetically (same as audio player and file manager)
+    if (file_count > 1) {
+        for (int i = 0; i < file_count - 1; i++) {
+            for (int j = i + 1; j < file_count; j++) {
+                // Compare directories first (dirs before files), then alphabetically
+                bool swap = false;
+                if (file_list[i].is_dir && !file_list[j].is_dir) {
+                    swap = false;  // Keep directories first
+                } else if (!file_list[i].is_dir && file_list[j].is_dir) {
+                    swap = true;  // Move directory before file
+                } else {
+                    // Both are dirs or both are files, sort alphabetically
+                    if (strcasecmp(file_list[i].name, file_list[j].name) > 0) {
+                        swap = true;
+                    }
+                }
+                
+                if (swap) {
+                    web_file_entry_t temp = file_list[i];
+                    file_list[i] = file_list[j];
+                    file_list[j] = temp;
+                }
+            }
+        }
+    }
+    
+    // Send JSON response
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr_chunk(req, "{\"files\":[");
+    
+    for (int i = 0; i < file_count; i++) {
+        if (i > 0) {
             httpd_resp_sendstr_chunk(req, ",");
         }
-        first = false;
         
         char json_item[1024];
         snprintf(json_item, sizeof(json_item), 
                  "{\"name\":\"%s\",\"type\":\"%s\",\"size\":%ld}",
-                 entry->d_name, is_dir ? "dir" : "file", size);
+                 file_list[i].name, 
+                 file_list[i].is_dir ? "dir" : "file", 
+                 file_list[i].size);
         httpd_resp_sendstr_chunk(req, json_item);
     }
     
-    closedir(dir);
+    free(file_list);
     httpd_resp_sendstr_chunk(req, "]}");
     httpd_resp_sendstr_chunk(req, NULL);
     
@@ -510,6 +561,11 @@ static esp_err_t upload_post_handler(httpd_req_t *req)
     if (f) {
         fclose(f);
         ESP_LOGI(TAG, "File uploaded: %s", filepath);
+        
+        // Pause playback and rescan audio files
+        audio_player_pause();
+        audio_player_scan_wav_files();
+        
         httpd_resp_sendstr(req, "File uploaded successfully");
     } else {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Upload failed");
@@ -533,6 +589,11 @@ static esp_err_t delete_handler(httpd_req_t *req)
                 
                 if (remove(filepath) == 0) {
                     ESP_LOGI(TAG, "File deleted: %s", filepath);
+                    
+                    // Pause playback and rescan audio files
+                    audio_player_pause();
+                    audio_player_scan_wav_files();
+                    
                     httpd_resp_sendstr(req, "File deleted");
                 } else {
                     httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
@@ -610,6 +671,11 @@ static esp_err_t rename_handler(httpd_req_t *req)
     // Perform rename
     if (rename(oldPath, newPath) == 0) {
         ESP_LOGI(TAG, "File renamed: %s -> %s", oldPath, newPath);
+        
+        // Pause playback and rescan audio files
+        audio_player_pause();
+        audio_player_scan_wav_files();
+        
         httpd_resp_sendstr(req, "File renamed");
     } else {
         ESP_LOGE(TAG, "Rename failed: %s -> %s", oldPath, newPath);
@@ -820,6 +886,10 @@ static void start_wifi_ap(void)
     
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    
+    // Pause audio playback before starting WiFi to prevent display issues
+    audio_player_pause();
+    
     ESP_ERROR_CHECK(esp_wifi_start());
     
     ESP_LOGI(TAG, "WiFi AP starting. SSID:%s password:%s channel:%d",
@@ -877,6 +947,10 @@ static void start_wifi_sta(void)
     
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    
+    // Pause audio playback before starting WiFi to prevent display issues
+    audio_player_pause();
+    
     ESP_ERROR_CHECK(esp_wifi_start());
     
     ESP_LOGI(TAG, "WiFi STA started. Connecting to SSID:%s", sta_ssid);

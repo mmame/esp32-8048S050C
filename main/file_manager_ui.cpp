@@ -507,6 +507,33 @@ static void scan_files(void)
     }
 
     closedir(dir);
+    
+    // Sort files alphabetically (same as audio player)
+    if (file_count > 1) {
+        for (int i = 0; i < file_count - 1; i++) {
+            for (int j = i + 1; j < file_count; j++) {
+                // Compare directories first (dirs before files), then alphabetically
+                bool swap = false;
+                if (files[i].is_dir && !files[j].is_dir) {
+                    swap = false;  // Keep directories first
+                } else if (!files[i].is_dir && files[j].is_dir) {
+                    swap = true;  // Move directory before file
+                } else {
+                    // Both are dirs or both are files, sort alphabetically
+                    if (strcasecmp(files[i].name, files[j].name) > 0) {
+                        swap = true;
+                    }
+                }
+                
+                if (swap) {
+                    file_item_t temp = files[i];
+                    files[i] = files[j];
+                    files[j] = temp;
+                }
+            }
+        }
+    }
+    
     ESP_LOGI(TAG, "Found %d files/folders in %s", file_count, scan_path);
 }
 

@@ -262,6 +262,10 @@ static void screen_gesture_event_cb(lv_event_t * e)
         if (dir == LV_DIR_LEFT) {
             // Swipe left to show file manager
             ESP_LOGI("AudioPlayer", "Swipe LEFT detected, showing file manager");
+            
+            // Pause playback when leaving audio player screen
+            audio_player_pause();
+            
             last_transition_time = esp_timer_get_time() / 1000;
             file_manager_show();
         }

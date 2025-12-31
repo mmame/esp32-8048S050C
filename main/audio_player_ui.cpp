@@ -912,16 +912,36 @@ static void audio_playback_task(void *arg)
                          samples, frame_info.frame_bytes, mp3_buffer_pos, mp3_buffer_len, mp3_file_pos);
                 
                 if (samples > 0) {
+                    // Store bitrate from first valid frame (for seeking and duration calculations)
+                    if (!mp3_total_time_updated && frame_info.bitrate_kbps > 0) {
+                        mp3_bitrate_kbps = frame_info.bitrate_kbps;
+                        ESP_LOGI(TAG, "MP3 bitrate detected: %d kbps (from first frame)", mp3_bitrate_kbps);
+                        
+                        // Update total time label now that we know the actual bitrate
+                        if (time_total_label) {
+                            // Estimate duration: (file_size_bytes * 8) / (bitrate_kbps * 1000)
+                            uint32_t estimated_seconds = (mp3_file_size * 8) / (frame_info.bitrate_kbps * 1000);
+                            uint32_t minutes = estimated_seconds / 60;
+                            uint32_t seconds = estimated_seconds % 60;
+                            char time_text[16];
+                            snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
+                            lv_lock();
+                            lv_label_set_text(time_total_label, time_text);
+                            lv_unlock();
+                            mp3_total_time_updated = true;
+                            ESP_LOGI(TAG, "MP3 duration recalculated: file_size=%lu bytes, bitrate=%d kbps, duration=%02lu:%02lu", 
+                                     mp3_file_size, frame_info.bitrate_kbps, minutes, seconds);
+                        }
+                    }
+                    
                     // Update sample rate if changed
                     if (frame_info.hz > 0 && frame_info.hz != (int)audio->sample_rate) {
+                        ESP_LOGI(TAG, "MP3 format change detected: %d Hz -> %d Hz, %d ch -> %d ch, bitrate: %d kbps", 
+                                 audio->sample_rate, frame_info.hz, audio->num_channels, frame_info.channels, frame_info.bitrate_kbps);
+                        
                         audio->sample_rate = frame_info.hz;
                         audio->num_channels = frame_info.channels;
                         bytes_per_second = audio->sample_rate * audio->num_channels * 2;  // 16-bit = 2 bytes
-                        
-                        // Store bitrate for seeking calculations
-                        if (frame_info.bitrate_kbps > 0) {
-                            mp3_bitrate_kbps = frame_info.bitrate_kbps;
-                        }
                         
                         // Reconfigure I2S completely (clock and slot configuration)
                         ESP_LOGI(TAG, "MP3 format: %d Hz, %d ch", frame_info.hz, frame_info.channels);
@@ -939,21 +959,6 @@ static void audio_playback_task(void *arg)
                         ESP_ERROR_CHECK(i2s_channel_reconfig_std_slot(tx_handle, &slot_cfg));
                         
                         i2s_channel_enable(tx_handle);
-                        
-                        // Update total time label now that we know the format
-                        if (!mp3_total_time_updated && time_total_label && frame_info.bitrate_kbps > 0) {
-                            // Estimate duration: (file_size_bytes * 8) / (bitrate_kbps * 1000)
-                            uint32_t estimated_seconds = (mp3_file_size * 8) / (frame_info.bitrate_kbps * 1000);
-                            uint32_t minutes = estimated_seconds / 60;
-                            uint32_t seconds = estimated_seconds % 60;
-                            char time_text[16];
-                            snprintf(time_text, sizeof(time_text), "%02lu:%02lu", minutes, seconds);
-                            lv_lock();
-                            lv_label_set_text(time_total_label, time_text);
-                            lv_unlock();
-                            mp3_total_time_updated = true;
-                            ESP_LOGI(TAG, "MP3 estimated duration: %02lu:%02lu (bitrate: %d kbps)", minutes, seconds, frame_info.bitrate_kbps);
-                        }
                     }
                     
                     // Write PCM samples to I2S
@@ -1388,6 +1393,7 @@ void audio_player_scan_wav_files(void)
     }
     
     // Update UI with first file if available
+    lv_lock();  // MUST lock LVGL before updating UI elements
     if (wav_file_count > 0 && title_label) {
         lv_label_set_text(title_label, audio_files[0].name);
         
@@ -1415,6 +1421,7 @@ void audio_player_scan_wav_files(void)
     } else if (title_label) {
         lv_label_set_text(title_label, "No audio files found on SD card");
     }
+    lv_unlock();
 }
 
 // Play a WAV file
@@ -1522,15 +1529,20 @@ void audio_player_play(const char *filename)
                 fclose(f);
                 
                 // duration = (file_size_bytes * 8) / (bitrate_bps)
-                // Using 192 kbps as default estimate
-                uint32_t estimated_seconds = (file_size * 8) / (192 * 1000);
+                // Using 128 kbps as default estimate
+                uint32_t estimated_bitrate_kbps = 128;
+                uint32_t estimated_seconds = (file_size * 8) / (estimated_bitrate_kbps * 1000);
                 uint32_t minutes = estimated_seconds / 60;
                 uint32_t seconds = estimated_seconds % 60;
                 char time_text[16];
                 snprintf(time_text, sizeof(time_text), "~%02lu:%02lu", minutes, seconds);
                 lv_label_set_text(time_total_label, time_text);
+                
+                ESP_LOGI(TAG, "MP3 duration estimate: file_size=%ld bytes, bitrate=%lu kbps, duration=%lu:%02lu", 
+                         file_size, estimated_bitrate_kbps, minutes, seconds);
             } else {
                 lv_label_set_text(time_total_label, "--:--");
+                ESP_LOGW(TAG, "Failed to open MP3 file for duration estimation");
             }
         } else {
             lv_label_set_text(time_total_label, "--:--");

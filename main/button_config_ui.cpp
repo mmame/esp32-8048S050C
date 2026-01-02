@@ -7,9 +7,14 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <stdio.h>
 
 static const char *TAG = "ButtonConfig";
+
+// NVS namespace for storing button configurations
+#define NVS_NAMESPACE "button_cfg"
 
 // ADC Configuration - Using GPIO2 (ADC1 Channel 1)
 #define BUTTON_ADC_UNIT         ADC_UNIT_1
@@ -43,7 +48,6 @@ static button_config_t button_configs[NUM_BUTTONS] = {
 static lv_obj_t *button_config_screen = NULL;
 static lv_obj_t *adc_value_label = NULL;
 static lv_obj_t *action_list = NULL;
-static lv_obj_t *back_btn = NULL;
 
 // List item elements for each button
 static lv_obj_t *list_items[NUM_BUTTONS];
@@ -55,6 +59,11 @@ static lv_obj_t *clear_buttons[NUM_BUTTONS];
 static adc_oneshot_unit_handle_t adc_handle = NULL;
 static bool adc_initialized = false;
 
+// Debouncing state
+static int last_button_pressed = -1;
+static uint32_t last_button_time = 0;
+#define DEBOUNCE_MS 300  // 300ms debounce time
+
 // Learning state
 static int learning_button_index = -1;  // Which button we're learning (-1 = none)
 
@@ -62,15 +71,83 @@ static int learning_button_index = -1;  // Which button we're learning (-1 = non
 static void init_adc(void);
 static void button_scan_task(void *arg);
 static void update_ui_task(void *arg);
+static void save_button_config(void);
+static void load_button_config(void);
 
-// Event handlers
-static void back_btn_event_cb(lv_event_t * e)
+// Gesture event callback for swipe navigation
+static void button_config_gesture_event_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_CLICKED) {
-        button_config_hide();
-        audio_player_show();
+    
+    if (code == LV_EVENT_GESTURE) {
+        lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+        
+        if (dir == LV_DIR_RIGHT) {
+            ESP_LOGI(TAG, "Swipe RIGHT detected, returning to WiFi config");
+            wifi_config_show();
+        }
     }
+}
+
+// Save button configuration to NVS
+static void save_button_config(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Error opening NVS handle: %s", esp_err_to_name(err));
+        return;
+    }
+
+    // Save each button configuration
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        char key_min[16], key_max[16], key_cfg[16];
+        snprintf(key_min, sizeof(key_min), "btn%d_min", i);
+        snprintf(key_max, sizeof(key_max), "btn%d_max", i);
+        snprintf(key_cfg, sizeof(key_cfg), "btn%d_cfg", i);
+        
+        nvs_set_u16(nvs_handle, key_min, button_configs[i].adc_min);
+        nvs_set_u16(nvs_handle, key_max, button_configs[i].adc_max);
+        nvs_set_u8(nvs_handle, key_cfg, button_configs[i].configured ? 1 : 0);
+    }
+
+    nvs_commit(nvs_handle);
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Button configuration saved to NVS");
+}
+
+// Load button configuration from NVS
+static void load_button_config(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "No saved button config found, using defaults");
+        return;
+    }
+
+    // Load each button configuration
+    for (int i = 0; i < NUM_BUTTONS; i++) {
+        char key_min[16], key_max[16], key_cfg[16];
+        snprintf(key_min, sizeof(key_min), "btn%d_min", i);
+        snprintf(key_max, sizeof(key_max), "btn%d_max", i);
+        snprintf(key_cfg, sizeof(key_cfg), "btn%d_cfg", i);
+        
+        uint16_t min_val, max_val;
+        uint8_t configured;
+        
+        if (nvs_get_u16(nvs_handle, key_min, &min_val) == ESP_OK &&
+            nvs_get_u16(nvs_handle, key_max, &max_val) == ESP_OK &&
+            nvs_get_u8(nvs_handle, key_cfg, &configured) == ESP_OK) {
+            button_configs[i].adc_min = min_val;
+            button_configs[i].adc_max = max_val;
+            button_configs[i].configured = (configured != 0);
+            ESP_LOGI(TAG, "Loaded button %d: %d-%d, configured=%d", i, min_val, max_val, configured);
+        }
+    }
+
+    nvs_close(nvs_handle);
+    ESP_LOGI(TAG, "Button configuration loaded from NVS");
 }
 
 // Initialize ADC for button scanning
@@ -129,7 +206,7 @@ uint16_t button_config_get_adc_value(void)
             adc_sum += adc_raw;
             valid_samples++;
         } else if (ret == ESP_ERR_TIMEOUT) {
-            ESP_LOGW(TAG, "ADC read timeout (attempt %d)", i);
+            //ESP_LOGW(TAG, "ADC read timeout (attempt %d)", i);
             vTaskDelay(pdMS_TO_TICKS(5));
         } else {
             ESP_LOGE(TAG, "ADC read error: %s", esp_err_to_name(ret));
@@ -233,6 +310,9 @@ static bool assign_button_value(int button_index, uint16_t adc_value)
 
     ESP_LOGI(TAG, "Button %d learned: ADC %d (range %d-%d)", button_index, adc_value, adc_min, adc_max);
     
+    // Save to NVS
+    save_button_config();
+    
     return true;
 }
 
@@ -248,6 +328,9 @@ static void clear_button_config(int button_index)
     button_configs[button_index].adc_max = 0;
     
     ESP_LOGI(TAG, "Button %d cleared", button_index);
+    
+    // Save to NVS
+    save_button_config();
 }
 
 // Button scanning task
@@ -291,37 +374,50 @@ static void button_scan_task(void *arg)
                 }
             }
         } else if (button_index >= 0) {
-            // Normal mode - handle button actions when a valid button is detected
-            switch (button_index) {
-                case 0:
-                    // Play
-                    audio_player_resume();
-                    break;
-                case 1:
-                    // Pause
-                    audio_player_pause();
-                    break;
-                case 2:
-                    // Play/Pause toggle
-                    if (audio_player_is_playing()) {
-                        audio_player_pause();
-                    } else {
+            // Normal mode - handle button actions with debouncing
+            uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            
+            // Only trigger if it's a different button OR enough time has passed
+            if (button_index != last_button_pressed || 
+                (current_time - last_button_time) >= DEBOUNCE_MS) {
+                
+                last_button_pressed = button_index;
+                last_button_time = current_time;
+                
+                switch (button_index) {
+                    case 0:
+                        // Play
                         audio_player_resume();
-                    }
-                    break;
-                case 3:
-                    // Previous track
-                    audio_player_previous();
-                    break;
-                case 4:
-                    // Next track
-                    audio_player_next();
-                    break;
-                case 5:
-                    // Stop
-                    audio_player_stop();
-                    break;
+                        break;
+                    case 1:
+                        // Pause
+                        audio_player_pause();
+                        break;
+                    case 2:
+                        // Play/Pause toggle
+                        if (audio_player_is_playing()) {
+                            audio_player_pause();
+                        } else {
+                            audio_player_resume();
+                        }
+                        break;
+                    case 3:
+                        // Previous track
+                        audio_player_previous();
+                        break;
+                    case 4:
+                        // Next track
+                        audio_player_next();
+                        break;
+                    case 5:
+                        // Stop
+                        audio_player_stop();
+                        break;
+                }
             }
+        } else {
+            // No button pressed - reset debounce state
+            last_button_pressed = -1;
         }
 
         vTaskDelay(pdMS_TO_TICKS(10)); // Check every 10ms
@@ -367,6 +463,11 @@ static void create_button_config_ui(void)
 {
     button_config_screen = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(button_config_screen, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_add_flag(button_config_screen, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(button_config_screen, LV_OBJ_FLAG_SCROLLABLE);
+    
+    // Add gesture event for swipe navigation
+    lv_obj_add_event_cb(button_config_screen, button_config_gesture_event_cb, LV_EVENT_GESTURE, NULL);
 
     // Title
     lv_obj_t *title = lv_label_create(button_config_screen);
@@ -478,15 +579,6 @@ static void create_button_config_ui(void)
             }
         }, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
-
-    // Back button
-    back_btn = lv_btn_create(button_config_screen);
-    lv_obj_set_size(back_btn, 150, 50);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -10);
-    lv_obj_add_event_cb(back_btn, back_btn_event_cb, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *back_label = lv_label_create(back_btn);
-    lv_label_set_text(back_label, "Back");
-    lv_obj_center(back_label);
 }
 
 // Initialize button config UI
@@ -494,6 +586,9 @@ void button_config_ui_init(void)
 {
     // Initialize ADC
     init_adc();
+    
+    // Load saved configuration from NVS
+    load_button_config();
 
     // Create UI
     create_button_config_ui();
